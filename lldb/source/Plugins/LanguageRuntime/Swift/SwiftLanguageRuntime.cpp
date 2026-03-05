@@ -2278,6 +2278,226 @@ protected:
   }
 };
 
+namespace {
+using TaskInfo = ReflectionContextInterface::AsyncTaskInfo;
+
+/// Finds the Thread that is currently running a task, otherwise creates a
+/// ThreadTask for it.
+static ThreadSP FindThreadForTask(ExecutionContext &exe_ctx,
+                                  const TaskInfo &task_info) {
+  // For running tasks, TaskInfo won't have frame information, but LLDB should.
+  if (task_info.isRunning) {
+    // See OperatingSystemSwiftTasks for how these are created.
+    constexpr uint64_t TASK_MASK = 0x0000000f00000000ULL;
+    uint64_t tid = task_info.id | TASK_MASK;
+
+    auto &thread_list = exe_ctx.GetProcessRef().GetThreadList();
+    if (ThreadSP thread = thread_list.FindThreadByID(tid, /*can_update=*/false))
+      return thread;
+  }
+
+  // There should always be frame information for Tasks that are not running. If
+  // not, fallback to runJob.
+  lldb::addr_t frame_zero_pc = task_info.asyncBacktracePcs.empty()
+                                   ? task_info.runJob
+                                   : task_info.asyncBacktracePcs[0];
+
+  return std::make_shared<ThreadTask>(
+      task_info.id, task_info.resumeAsyncContext, frame_zero_pc, exe_ctx);
+}
+
+static void PrintFramesForTask(ExecutionContext &exe_ctx,
+                               const TaskInfo &task_info, Stream &str,
+                               uint64_t max_frames,
+                               llvm::StringRef frame_prefix) {
+  if (task_info.isComplete) {
+    str << frame_prefix << "task completed\n";
+    return;
+  }
+  if (max_frames == 0)
+    return;
+
+  auto thread = FindThreadForTask(exe_ctx, task_info);
+  auto frame_list = thread ? thread->GetStackFrameList() : nullptr;
+  const uint64_t num_frames_available =
+      frame_list ? frame_list->GetNumFrames() : 0;
+  if (num_frames_available == 0)
+    return;
+
+  uint64_t frames_printed = 0;
+  for (uint64_t idx : llvm::seq(num_frames_available)) {
+    auto frame = thread->GetStackFrameAtIndex(idx);
+    if (!frame || frame->IsHidden())
+      continue;
+    str << frame_prefix;
+    str.Printf("frame #%u: ", frame->GetFrameIndex());
+    SymbolContext sc = frame->GetSymbolContext(eSymbolContextEverything);
+    sc.DumpStopContext(&str, exe_ctx.GetBestExecutionContextScope(),
+                       frame->GetFrameCodeAddress(),
+                       /*show_fullpaths=*/false,
+                       /*show_module=*/false, /*show_inlined_frames=*/true,
+                       /*show_function_arguments=*/true,
+                       /*show_function_name=*/true,
+                       /*show_function_display_name=*/true);
+    str << "\n";
+    frames_printed++;
+    if (frames_printed >= max_frames)
+      break;
+  }
+}
+
+class TaskExplorer {
+public:
+  TaskExplorer(ReflectionContextInterface &reflection_ctx, Process &process)
+      : m_reflection_ctx(reflection_ctx) {
+    TaskInspector task_inspector;
+
+    for (const ThreadSP &thread : process.GetThreadList().Threads()) {
+      if (!thread)
+        continue;
+      std::optional<lldb::addr_t> maybe_task_addr =
+          task_inspector.GetTaskAddrFromThreadLocalStorage(*thread);
+      if (!maybe_task_addr)
+        continue;
+      int32_t max_nodes = 1000;
+      ExploreTask(*maybe_task_addr, max_nodes);
+    }
+  }
+
+  auto GetRootTasks() const {
+    auto filtered =
+        llvm::make_filter_range(llvm::make_second_range(m_known_tasks),
+                                [](const std::optional<TaskInfo> &info) {
+                                  return info && info->parentTask == 0;
+                                });
+    return llvm::map_range(filtered, [](auto &maybe_info) -> const TaskInfo & {
+      return *maybe_info;
+    });
+  }
+
+  const std::optional<TaskInfo> &FindTask(addr_t task_addr) {
+    int32_t max_nodes = 1000;
+    ExploreTask(task_addr, max_nodes);
+    auto it = m_known_tasks.find(task_addr);
+    assert(it != m_known_tasks.end());
+    return it->second;
+  }
+
+private:
+  ReflectionContextInterface &m_reflection_ctx;
+  std::map<addr_t, std::optional<TaskInfo>> m_known_tasks;
+
+  // Finds all Tasks reachable from the Task represented by `task_addr`.
+  // This follows child pointers, parent pointers, "waited by" pointers.
+  void ExploreTask(addr_t task_addr, int32_t &max_nodes) {
+    if (m_known_tasks.count(task_addr))
+      return;
+    if (--max_nodes <= 0) {
+      m_known_tasks.emplace(task_addr, std::nullopt);
+      return;
+    }
+
+    llvm::Expected<TaskInfo> task_info =
+        m_reflection_ctx.asyncTaskInfo(task_addr);
+    if (!task_info) {
+      llvm::consumeError(task_info.takeError());
+      m_known_tasks.emplace(task_addr, std::nullopt);
+      return;
+    }
+    if (task_info->id == 0) {
+      m_known_tasks.emplace(task_addr, std::nullopt);
+      return;
+    }
+
+    auto [it, _] = m_known_tasks.emplace(task_addr, std::move(*task_info));
+
+    for (addr_t child_addr : it->second->childTasks)
+      ExploreTask(child_addr, max_nodes);
+    if (it->second->parentTask != 0)
+      ExploreTask(it->second->parentTask, max_nodes);
+    for (addr_t waited_by_task_addr : it->second->waitingTasks)
+      ExploreTask(waited_by_task_addr, max_nodes);
+  }
+};
+
+/// Prints the symbols that make the output of task graph look like a tree of
+/// connected Tasks.
+static void PrintTaskPrefix(Stream &stream, StringRef prefix, bool is_last) {
+  static const bool supports_unicode = Terminal::SupportsUnicode();
+  if (supports_unicode)
+    stream << prefix << (is_last ? "└╴ " : "├╴ ");
+  else
+    stream << prefix << "|-";
+}
+
+/// Computes the prefixes to be used when printing one level deeper in the
+/// Parent-Child tree.
+static std::pair<std::string, std::string>
+ComputeNestedPrefixes(StringRef current_prefix, bool is_last,
+                      bool has_children) {
+  static const bool supports_unicode = Terminal::SupportsUnicode();
+
+  std::string child_prefix = [&] {
+    if (is_last)
+      return (current_prefix + "   ").str();
+    if (supports_unicode)
+      return (current_prefix + "│  ").str();
+    return (current_prefix + "|  ").str();
+  }();
+
+  std::string frame_prefix = [&] {
+    if (!has_children)
+      return child_prefix + "  ";
+    if (supports_unicode)
+      return child_prefix + "│ ";
+    return child_prefix + "| ";
+  }();
+  return {child_prefix, frame_prefix};
+}
+
+/// Prints a Task in the case where no TaskInfo was found.
+static void PrintNoInfoTaskTree(addr_t task_addr, Stream &stream,
+                                llvm::StringRef prefix, bool is_last) {
+  PrintTaskPrefix(stream, prefix, is_last);
+  stream << llvm::formatv("Task @ addr = {0:x}: no information available\n",
+                          task_addr)
+                .str();
+}
+
+/// Prints the tree of all tasks rooted at the task represented by `task_addr`.
+static void PrintTaskTree(const TaskInfo &task_info, Stream &stream,
+                          ExecutionContext &exe_ctx,
+                          TaskExplorer &task_explorer, int64_t &max_nodes,
+                          uint64_t max_frames, llvm::StringRef prefix,
+                          bool is_last) {
+  // Guard against corrupted data.
+  max_nodes--;
+  if (max_nodes <= 0) {
+    stream << "... output truncated ...\n";
+    return;
+  }
+
+  PrintTaskPrefix(stream, prefix, is_last);
+  stream << llvm::formatv("Task {0} (addr = {1:x})\n", task_info.id,
+                          task_info.taskAddr)
+                .str();
+
+  auto [child_prefix, frame_prefix] =
+      ComputeNestedPrefixes(prefix, is_last, task_info.childTasks.size() > 0);
+
+  PrintFramesForTask(exe_ctx, task_info, stream, max_frames, frame_prefix);
+  for (auto [idx, child_addr] : llvm::enumerate(task_info.childTasks)) {
+    const bool is_last = idx == task_info.childTasks.size() - 1;
+    if (const std::optional<TaskInfo> &child_info =
+            task_explorer.FindTask(child_addr))
+      PrintTaskTree(*child_info, stream, exe_ctx, task_explorer, max_nodes,
+                    max_frames, child_prefix, is_last);
+    else
+      PrintNoInfoTaskTree(child_addr, stream, child_prefix, is_last);
+  }
+}
+} // namespace
+
 /// Construct a `ThreadTask` instance for a live (yet to be completed) Task
 /// variable contained in the first argument.
 static llvm::Expected<ThreadSP>
@@ -2400,6 +2620,102 @@ private:
   }
 };
 
+static OptionDefinition g_task_graph_options[] = {
+    // clang-format off
+  {LLDB_OPT_SET_1, false, "max-frames", 'f', OptionParser::eRequiredArgument, nullptr, {}, 1, eArgTypeCount, "Maximum number of stack frames to show per task."},
+    // clang-format on
+};
+
+class CommandObjectLanguageSwiftTaskGraph final : public CommandObjectParsed {
+public:
+  CommandObjectLanguageSwiftTaskGraph(CommandInterpreter &interpreter)
+      : CommandObjectParsed(interpreter, "graph",
+                            "Print info about all the Tasks that are active "
+                            "and their parents and children.",
+                            "language swift task graph [--max-frames <count>]"),
+        m_options() {}
+
+  Options *GetOptions() override { return &m_options; }
+
+private:
+  void DoExecute(Args &command, CommandReturnObject &result) override {
+    if (m_exe_ctx.GetProcessPtr() == nullptr) {
+      result.AppendError("must be run from a running process");
+      return;
+    }
+
+    auto *runtime = SwiftLanguageRuntime::Get(m_exe_ctx.GetProcessSP());
+    if (!runtime) {
+      result.AppendError("Failed to find Swift Language runtime");
+      return;
+    }
+
+    auto reflection_ctx = runtime->GetReflectionContext();
+    if (!reflection_ctx) {
+      result.AppendError("Failed to get a Swift reflection context");
+      return;
+    }
+
+    TaskExplorer task_explorer(**reflection_ctx, m_exe_ctx.GetProcessRef());
+
+    // Make a copy of the TaskInfos so that the range may be sorted by Task id.
+    llvm::SmallVector<TaskInfo> root_tasks(task_explorer.GetRootTasks());
+    llvm::sort(root_tasks,
+               [](const auto &t1, const auto &t2) { return t1.id < t2.id; });
+
+    int64_t max_nodes = 10000;
+    for (auto [idx, task_info] : llvm::enumerate(root_tasks))
+      PrintTaskTree(task_info, result.GetOutputStream(), m_exe_ctx,
+                    task_explorer, max_nodes, m_options.m_max_frames,
+                    /*prefix=*/"", idx == root_tasks.size() - 1);
+
+    result.SetStatus(lldb::eReturnStatusSuccessFinishResult);
+  }
+
+  class CommandOptions : public Options {
+  public:
+    CommandOptions() : Options() { OptionParsingStarting(nullptr); }
+
+    ~CommandOptions() override = default;
+
+    Status SetOptionValue(uint32_t option_idx, llvm::StringRef option_arg,
+                          ExecutionContext *execution_context) override {
+      Status error;
+      const int short_option = m_getopt_table[option_idx].val;
+      switch (short_option) {
+      case 'f': {
+        uint64_t count;
+        if (option_arg.getAsInteger(0, count)) {
+          error = Status::FromErrorStringWithFormat(
+              "invalid integer value for option '%c': %s", short_option,
+              option_arg.data());
+        } else {
+          m_max_frames = count;
+        }
+        break;
+      }
+      default:
+        error = Status::FromErrorStringWithFormat(
+            "invalid short option character '%c'", short_option);
+        break;
+      }
+      return error;
+    }
+
+    void OptionParsingStarting(ExecutionContext *execution_context) override {
+      m_max_frames = 8;
+    }
+
+    llvm::ArrayRef<OptionDefinition> GetDefinitions() override {
+      return llvm::ArrayRef(g_task_graph_options);
+    }
+
+    uint64_t m_max_frames = 8;
+  };
+
+  CommandOptions m_options;
+};
+
 class CommandObjectLanguageSwiftTaskInfo final : public CommandObjectParsed {
 public:
   CommandObjectLanguageSwiftTaskInfo(CommandInterpreter &interpreter)
@@ -2492,6 +2808,9 @@ public:
     LoadSubCommand(
         "info",
         CommandObjectSP(new CommandObjectLanguageSwiftTaskInfo(interpreter)));
+    LoadSubCommand(
+        "graph",
+        CommandObjectSP(new CommandObjectLanguageSwiftTaskGraph(interpreter)));
   }
 };
 
