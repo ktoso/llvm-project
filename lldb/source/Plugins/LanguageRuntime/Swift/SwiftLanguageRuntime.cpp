@@ -2375,6 +2375,15 @@ public:
     });
   }
 
+  auto GetAllTasks() const {
+    auto filtered = llvm::make_filter_range(
+        llvm::make_second_range(m_known_tasks),
+        [](const std::optional<TaskInfo> &info) { return info.has_value(); });
+    return llvm::map_range(filtered, [](auto &maybe_info) -> const TaskInfo & {
+      return *maybe_info;
+    });
+  }
+
   const std::optional<TaskInfo> &FindTask(addr_t task_addr) {
     int32_t max_nodes = 1000;
     ExploreTask(task_addr, max_nodes);
@@ -2620,6 +2629,84 @@ private:
   }
 };
 
+class CommandObjectLanguageSwiftTaskList final : public CommandObjectParsed {
+public:
+  CommandObjectLanguageSwiftTaskList(CommandInterpreter &interpreter)
+      : CommandObjectParsed(
+            interpreter, "list",
+            "List all discovered Swift Tasks, creating a thread "
+            "representation for each one.",
+            "language swift task list") {}
+
+private:
+  void DoExecute(Args &command, CommandReturnObject &result) override {
+    if (m_exe_ctx.GetProcessPtr() == nullptr) {
+      result.AppendError("must be run from a running process");
+      return;
+    }
+
+    auto *runtime = SwiftLanguageRuntime::Get(m_exe_ctx.GetProcessSP());
+    if (!runtime) {
+      result.AppendError("Failed to find Swift Language runtime");
+      return;
+    }
+
+    auto reflection_ctx = runtime->GetReflectionContext();
+    if (!reflection_ctx) {
+      result.AppendError("Failed to get a Swift reflection context");
+      return;
+    }
+
+    TaskExplorer task_explorer(**reflection_ctx, m_exe_ctx.GetProcessRef());
+
+    // Make a copy so we can sort by Task id.
+    llvm::SmallVector<TaskInfo> all_tasks(task_explorer.GetAllTasks());
+    llvm::sort(all_tasks,
+               [](const auto &t1, const auto &t2) { return t1.id < t2.id; });
+
+    const Thread *const selected_thread = m_exe_ctx.GetThreadPtr();
+
+    Stream &strm = result.GetOutputStream();
+    for (const TaskInfo &task_info : all_tasks) {
+      if (task_info.isComplete) {
+        strm.Printf("  task id = %" PRIu64 ", addr = 0x%" PRIx64
+                    " (completed)\n",
+                    task_info.id, task_info.taskAddr);
+        continue;
+      }
+
+      ThreadSP thread = FindThreadForTask(m_exe_ctx, task_info);
+      if (!thread)
+        continue;
+
+      // Selected thread prefix.
+      strm << (thread.get() == selected_thread ? "* " : "  ");
+
+      strm.Printf("task id = %" PRIu64 ", addr = 0x%" PRIx64, task_info.id,
+                  task_info.taskAddr);
+
+      StackFrameSP frame = thread->GetStackFrameAtIndex(0);
+      if (!frame) {
+        strm.EOL();
+        continue;
+      }
+
+      SymbolContext sc = frame->GetSymbolContext(eSymbolContextEverything);
+      strm << ", ";
+      sc.DumpStopContext(&strm, m_exe_ctx.GetBestExecutionContextScope(),
+                         frame->GetFrameCodeAddress(),
+                         /*show_fullpaths=*/false,
+                         /*show_module=*/true, /*show_inlined_frames=*/true,
+                         /*show_function_arguments=*/true,
+                         /*show_function_name=*/true,
+                         /*show_function_display_name=*/true);
+      strm.EOL();
+    }
+
+    result.SetStatus(lldb::eReturnStatusSuccessFinishResult);
+  }
+};
+
 static OptionDefinition g_task_graph_options[] = {
     // clang-format off
   {LLDB_OPT_SET_1, false, "max-frames", 'f', OptionParser::eRequiredArgument, nullptr, {}, 1, eArgTypeCount, "Maximum number of stack frames to show per task."},
@@ -2808,6 +2895,9 @@ public:
     LoadSubCommand(
         "info",
         CommandObjectSP(new CommandObjectLanguageSwiftTaskInfo(interpreter)));
+    LoadSubCommand(
+        "list",
+        CommandObjectSP(new CommandObjectLanguageSwiftTaskList(interpreter)));
     LoadSubCommand(
         "graph",
         CommandObjectSP(new CommandObjectLanguageSwiftTaskGraph(interpreter)));
