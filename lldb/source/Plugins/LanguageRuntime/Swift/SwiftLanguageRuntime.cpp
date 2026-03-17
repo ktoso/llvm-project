@@ -2392,9 +2392,19 @@ public:
     return it->second;
   }
 
+  /// Returns the TaskInfo of the task that `task_addr` is waiting on, if any.
+  const TaskInfo *GetDependency(addr_t task_addr) const {
+    auto it = m_blocked_by.find(task_addr);
+    return it != m_blocked_by.end() ? it->second : nullptr;
+  }
+
 private:
   ReflectionContextInterface &m_reflection_ctx;
   std::map<addr_t, std::optional<TaskInfo>> m_known_tasks;
+  /// Maps a task address to the TaskInfo it is waiting on. The pointers are
+  /// into m_known_tasks values, which is safe because std::map guarantees
+  /// pointer stability on insertion.
+  llvm::DenseMap<addr_t, TaskInfo *> m_blocked_by;
 
   // Finds all Tasks reachable from the Task represented by `task_addr`.
   // This follows child pointers, parent pointers, "waited by" pointers.
@@ -2424,8 +2434,10 @@ private:
       ExploreTask(child_addr, max_nodes);
     if (it->second->parentTask != 0)
       ExploreTask(it->second->parentTask, max_nodes);
-    for (addr_t waited_by_task_addr : it->second->waitingTasks)
+    for (addr_t waited_by_task_addr : it->second->waitingTasks) {
+      m_blocked_by.try_emplace(waited_by_task_addr, &*it->second);
       ExploreTask(waited_by_task_addr, max_nodes);
+    }
   }
 };
 
@@ -2487,9 +2499,14 @@ static void PrintTaskTree(const TaskInfo &task_info, Stream &stream,
   }
 
   PrintTaskPrefix(stream, prefix, is_last);
-  stream << llvm::formatv("Task {0} (addr = {1:x})\n", task_info.id,
+  stream << llvm::formatv("Task {0} (addr = {1:x})", task_info.id,
                           task_info.taskAddr)
                 .str();
+  if (const TaskInfo *dep = task_explorer.GetDependency(task_info.taskAddr))
+    stream << llvm::formatv(" awaiting task id = {0} (addr = {1:x})", dep->id,
+                            dep->taskAddr)
+                  .str();
+  stream.EOL();
 
   auto [child_prefix, frame_prefix] =
       ComputeNestedPrefixes(prefix, is_last, task_info.childTasks.size() > 0);

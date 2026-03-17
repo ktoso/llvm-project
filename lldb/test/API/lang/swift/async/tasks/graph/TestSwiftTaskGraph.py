@@ -26,7 +26,7 @@ class TestCase(TestBase):
 
         result = self.res.GetOutput().splitlines()
 
-        self.assertRegex(result[0], r"Task 1 \(addr = 0x[0-9a-fA-F]+\)")
+        self.assertRegex(result[0], r"Task 1 \(addr = 0x[0-9a-fA-F]+\) awaiting task id = 2")
         self.assertRegex(result[1], r"frame #0: Task<>.value.getter")
 
         result = result[2:]
