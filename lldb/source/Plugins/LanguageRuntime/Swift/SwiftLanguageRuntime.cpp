@@ -2499,8 +2499,16 @@ static void PrintTaskTree(const TaskInfo &task_info, Stream &stream,
   }
 
   PrintTaskPrefix(stream, prefix, is_last);
-  stream << llvm::formatv("Task {0} (addr = {1:x})", task_info.id,
-                          task_info.taskAddr)
+
+  // Try to get the user-provided task name.
+  std::string name_str;
+  if (auto name = GetTaskName(task_info.taskAddr, exe_ctx.GetProcessRef())) {
+    if (name->has_value())
+      name_str = llvm::formatv(" '{0}'", **name);
+  }
+
+  stream << llvm::formatv("Task {0}{1} (addr = {2:x})", task_info.id,
+                          name_str, task_info.taskAddr)
                 .str();
   if (const TaskInfo *dep = task_explorer.GetDependency(task_info.taskAddr))
     stream << llvm::formatv(" awaiting task id = {0} (addr = {1:x})", dep->id,
@@ -2685,10 +2693,19 @@ private:
 
     Stream &strm = result.GetOutputStream();
     for (const TaskInfo &task_info : all_tasks) {
+      // Try to get the user-provided task name.
+      std::string name_field;
+      if (auto name =
+              GetTaskName(task_info.taskAddr, m_exe_ctx.GetProcessRef())) {
+        if (name->has_value())
+          name_field = llvm::formatv(", name = '{0}'", **name);
+      }
+
       if (task_info.isComplete) {
-        strm.Printf("  task id = %" PRIu64 ", addr = 0x%" PRIx64
-                    " (completed)\n",
-                    task_info.id, task_info.taskAddr);
+        strm.Printf("  task id = %" PRIu64, task_info.id);
+        strm << name_field;
+        strm.Printf(", addr = 0x%" PRIx64 " (completed)\n",
+                    task_info.taskAddr);
         continue;
       }
 
@@ -2699,8 +2716,9 @@ private:
       // Selected thread prefix.
       strm << (thread.get() == selected_thread ? "* " : "  ");
 
-      strm.Printf("task id = %" PRIu64 ", addr = 0x%" PRIx64, task_info.id,
-                  task_info.taskAddr);
+      strm.Printf("task id = %" PRIu64, task_info.id);
+      strm << name_field;
+      strm.Printf(", addr = 0x%" PRIx64, task_info.taskAddr);
 
       StackFrameSP frame = thread->GetStackFrameAtIndex(0);
       if (!frame) {

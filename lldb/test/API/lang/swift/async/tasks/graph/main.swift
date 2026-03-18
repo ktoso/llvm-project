@@ -9,7 +9,7 @@ func factorial(n: Int) async -> Int {
 
 @main struct Main {
   static func main() async {
-    let task = Task {
+    let task = Task(name: "factorial-main") {
       await factorial(n: 3)
     }
     await task.value

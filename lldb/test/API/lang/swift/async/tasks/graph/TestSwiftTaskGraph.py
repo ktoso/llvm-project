@@ -17,7 +17,7 @@ class TestCase(TestBase):
         # (lldb) task graph --max-frames 1
         # ├╴ Task 1 (addr = 0x105192490)
         # │    frame #0: Task<>.value.getter at Task.swift:277:7
-        # └╴ Task 2 (addr = 0x1051939b0)
+        # └╴ Task 2 'factorial-main' (addr = 0x1051939b0)
         #    │ frame #0: factorial(n:) at main.swift:7
         #    └╴ Task 3 (addr = 0x105194490)
         #       │ frame #0: factorial(n:) at main.swift:7
@@ -30,7 +30,7 @@ class TestCase(TestBase):
         self.assertRegex(result[1], r"frame #0: Task<>.value.getter")
 
         result = result[2:]
-        self.assertRegex(result[0], r"Task 2 \(addr = 0x[0-9a-fA-F]+\)")
+        self.assertRegex(result[0], r"Task 2 'factorial-main' \(addr = 0x[0-9a-fA-F]+\)")
         self.assertRegex(result[1], r"frame #0: factorial.* at main.swift:7")
         self.assertRegex(result[2], r"Task 3 \(addr = 0x[0-9a-fA-F]+\)")
         self.assertRegex(result[3], r"frame #0: factorial.* at main.swift:7")

@@ -16,7 +16,7 @@ class TestCase(TestBase):
 
         # Expected output (4 tasks, sorted by id):
         #   task id = 1, addr = 0x..., ... Task<>() at Task.swift
-        #   task id = 2, addr = 0x..., ... factorial ... at main.swift:7
+        #   task id = 2, name = 'factorial-main', addr = 0x..., ... factorial ... at main.swift:7
         #   task id = 3, addr = 0x..., ... factorial ... at main.swift:7
         #   task id = 4, addr = 0x..., ... factorial ... at main.swift:3:5
 
@@ -27,7 +27,7 @@ class TestCase(TestBase):
         self.assertRegex(lines[0], r"task id = 1, addr = 0x[0-9a-fA-F]+")
         self.assertIn("Task<>", lines[0])
 
-        self.assertRegex(lines[1], r"task id = 2, addr = 0x[0-9a-fA-F]+")
+        self.assertRegex(lines[1], r"task id = 2, name = 'factorial-main', addr = 0x[0-9a-fA-F]+")
         self.assertIn("factorial", lines[1])
 
         self.assertRegex(lines[2], r"task id = 3, addr = 0x[0-9a-fA-F]+")
