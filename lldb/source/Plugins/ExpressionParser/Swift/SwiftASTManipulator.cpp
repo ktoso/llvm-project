@@ -1174,7 +1174,7 @@ static void AppendToCaptures(swift::ASTContext &ast_context,
       swift::CaptureInfo(ast_context, captures,
                          old_capture_info.getDynamicSelfType(),
                          old_capture_info.getOpaqueValue(),
-                         old_capture_info.hasGenericParamCaptures());
+                         old_capture_info.getFlags());
   func_decl->setCaptureInfo(new_capture_info);
 }
 
